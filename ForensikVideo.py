@@ -28,6 +28,9 @@ from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from reportlab.lib.utils import ImageReader
 from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Image as PlatypusImage, Table, TableStyle
 from reportlab.lib import colors
+from skimage.metrics import structural_similarity as ssim
+from scipy.io import wavfile
+import csv
 import matplotlib.pyplot as plt
 from tqdm import tqdm
 
@@ -161,6 +164,43 @@ def optical_flow_magnitude(prev_gray: np.ndarray, next_gray: np.ndarray) -> floa
     flow = cv2.calcOpticalFlowFarneback(prev_gray, next_gray, None, 0.5, 3, 15, 3, 5, 1.2, 0)
     mag, _ = cv2.cartToPolar(flow[..., 0], flow[..., 1]); return float(np.mean(mag))
 
+def extract_audio_wav(path: Path, out_path: Path) -> None:
+    """Ekstrak audio mono 16 kHz dari video menggunakan ffmpeg."""
+    cmd = [
+        "ffmpeg",
+        "-i",
+        str(path),
+        "-vn",
+        "-ac",
+        "1",
+        "-ar",
+        "16000",
+        "-acodec",
+        "pcm_s16le",
+        str(out_path),
+        "-hide_banner",
+        "-loglevel",
+        "error",
+    ]
+    try:
+        subprocess.run(cmd, check=True)
+    except subprocess.CalledProcessError:
+        print(f"{Icons.ERROR} ffmpeg gagal mengekstrak audio", file=sys.stderr)
+
+def analyze_audio_discontinuity(wav_path: Path) -> dict:
+    """Hitung skor diskontinuitas audio sederhana berdasarkan perbedaan amplitudo."""
+    try:
+        rate, data = wavfile.read(wav_path)
+        if data.ndim > 1:
+            data = data.mean(axis=1)
+        diff = np.abs(np.diff(data.astype(np.float32)))
+        median = np.median(diff)
+        mad = np.median(np.abs(diff - median)) + 1e-9
+        zscores = 0.6745 * (diff - median) / mad
+        return {"max_zscore": float(np.max(zscores))}
+    except Exception as e:
+        return {"error": str(e)}
+
 ###############################################################################
 # Algoritma Analisis (Inti tidak berubah)
 ###############################################################################
@@ -170,32 +210,89 @@ def analyze_pairwise(base_frames: list[FrameInfo], sus_frames: list[FrameInfo], 
         if hash_distance(base_frames[i].hash, sus_frames[j].hash) <= hash_thresh: sus_frames[j].type = "original"; i += 1; j += 1
         else:
             if j + 1 < len(sus_frames) and hash_distance(base_frames[i].hash, sus_frames[j + 1].hash) <= hash_thresh: sus_frames[j].type = "anomaly_insert"; sus_frames[j].evidence = {"description": f"Tidak ditemukan di referensi."}; j += 1
-            elif i + 1 < len(base_frames) and hash_distance(base_frames[i + 1].hash, sus_frames[j].hash) <= hash_thresh: print(f"  {Icons.INFO} Deteksi penghapusan: bingkai referensi {i} hilang."); i += 1
+            elif i + 1 < len(base_frames) and hash_distance(base_frames[i + 1].hash, sus_frames[j].hash) <= hash_thresh:
+                base_frames[i].type = "anomaly_delete"
+                base_frames[i].evidence = {"missing_before_index": j}
+                i += 1
             else: sus_frames[j].type = "anomaly_discontinuity"; sus_frames[j].evidence = {"description": f"Tidak cocok dengan ref. frame {i}."}; i += 1; j += 1
     for k in range(j, len(sus_frames)): sus_frames[k].type = "anomaly_insert"; sus_frames[k].evidence = {"description": "Bingkai tambahan di akhir."}
-    if i < len(base_frames): print(f"  {Icons.INFO} {len(base_frames) - i} bingkai akhir referensi hilang.")
+    if i < len(base_frames):
+        for idx in range(i, len(base_frames)):
+            base_frames[idx].type = "anomaly_delete"
+            base_frames[idx].evidence = {"missing_after_index": j}
 
-def analyze_single(frames: list[FrameInfo], hash_thresh_dup: int = 2, flow_z_thresh: float = 4.0):
-    hashes = [f.hash for f in frames]; n = len(frames)
+def analyze_single(frames: list[FrameInfo], hash_thresh_dup: int = 2, flow_z_thresh: float = 4.0, ssim_z_thresh: float = 4.0):
+    """Analisis mandiri untuk mendeteksi duplikasi, penyisipan, dan penghapusan
+    bingkai berdasarkan hash, aliran optik, dan SSIM."""
+
+    hashes = [f.hash for f in frames]
+    n = len(frames)
     if n < 2:
-        if n == 1: frames[0].type = "original"; return
+        if n == 1:
+            frames[0].type = "original"
+        return
+
+    # Deteksi duplikasi menggunakan jarak hash
     for idx in range(1, n):
-        if hash_distance(hashes[idx], hashes[idx - 1]) <= hash_thresh_dup: frames[idx].type = "anomaly_duplicate"; frames[idx].evidence = {"dup_of_index": idx - 1, "hash_distance": hash_distance(hashes[idx], hashes[idx - 1])}
-    mags = []; print(f"  {Icons.INFO} Menganalisis aliran optik...");
-    for idx in tqdm(range(1, n), desc="    Menghitung Aliran Optik", leave=False, bar_format='{l_bar}{bar}| {n_fmt}/{total_fmt}'):
-        if frames[idx].type != 'unknown': continue
+        if hash_distance(hashes[idx], hashes[idx - 1]) <= hash_thresh_dup:
+            frames[idx].type = "anomaly_duplicate"
+            frames[idx].evidence = {
+                "dup_of_index": idx - 1,
+                "hash_distance": hash_distance(hashes[idx], hashes[idx - 1]),
+            }
+
+    mags = []
+    ssim_vals = []
+    print(f"  {Icons.INFO} Menganalisis aliran optik & SSIM...")
+
+    for idx in tqdm(
+        range(1, n),
+        desc="    Menghitung Aliran Optik",
+        leave=False,
+        bar_format='{l_bar}{bar}| {n_fmt}/{total_fmt}',
+    ):
+        if frames[idx].type != "unknown":
+            continue
         try:
-            img_prev = cv2.imread(frames[idx - 1].img_path, cv2.IMREAD_GRAYSCALE); img_next = cv2.imread(frames[idx].img_path, cv2.IMREAD_GRAYSCALE)
-            if img_prev is None or img_next is None: continue
+            img_prev = cv2.imread(frames[idx - 1].img_path, cv2.IMREAD_GRAYSCALE)
+            img_next = cv2.imread(frames[idx].img_path, cv2.IMREAD_GRAYSCALE)
+            if img_prev is None or img_next is None:
+                continue
             mags.append((idx, optical_flow_magnitude(img_prev, img_next)))
-        except Exception as e: print(f"  {Icons.ERROR} Gagal aliran optik bingkai {idx}: {e}")
+            ssim_vals.append((idx, ssim(img_prev, img_next)))
+        except Exception as e:
+            print(f"  {Icons.ERROR} Gagal aliran optik/ssim bingkai {idx}: {e}")
+
     if mags:
-        flow_values = np.array([m[1] for m in mags]); median = np.median(flow_values); mad = np.median(np.abs(flow_values - median)) + 1e-9
+        flow_values = np.array([m[1] for m in mags])
+        median = np.median(flow_values)
+        mad = np.median(np.abs(flow_values - median)) + 1e-9
         for idx, mag in mags:
             z_score = 0.6745 * (mag - median) / mad
-            if abs(z_score) >= flow_z_thresh and frames[idx].type == 'unknown': frames[idx].type = "anomaly_discontinuity"; frames[idx].evidence = {"optical_flow_magnitude": float(mag), "z_score": float(z_score)}
+            if abs(z_score) >= flow_z_thresh and frames[idx].type == "unknown":
+                frames[idx].type = "anomaly_discontinuity"
+                frames[idx].evidence = {
+                    "optical_flow_magnitude": float(mag),
+                    "z_score": float(z_score),
+                }
+
+    if ssim_vals:
+        ssim_values = np.array([s[1] for s in ssim_vals])
+        median = np.median(ssim_values)
+        mad = np.median(np.abs(ssim_values - median)) + 1e-9
+        for idx, val in ssim_vals:
+            z_score = 0.6745 * (val - median) / mad
+            if z_score <= -ssim_z_thresh and frames[idx].type == "unknown":
+                frames[idx].type = "anomaly_discontinuity"
+                frames[idx].evidence = {
+                    "ssim": float(val),
+                    "z_score": float(z_score),
+                }
+
+    # Tandai sisanya sebagai asli
     for f in frames:
-        if f.type == 'unknown': f.type = "original"
+        if f.type == "unknown":
+            f.type = "original"
 
 ###############################################################################
 # Pelaporan Terpadu dan Visualisasi yang Diperkaya
@@ -341,6 +438,15 @@ def save_manifest(report_data: VideoResult | ComparisonResult, out_path: Path):
         js['results'] = asdict(report_data)
     out_path.write_text(json.dumps(js, indent=2), encoding='utf-8')
 
+def export_anomaly_csv(result: VideoResult, out_path: Path) -> None:
+    """Ekspor daftar bingkai anomali ke berkas CSV."""
+    with open(out_path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f)
+        writer.writerow(["frame_index", "timestamp", "type", "evidence"])
+        for fi in result.frames:
+            if fi.type.startswith("anomaly"):
+                writer.writerow([fi.index, f"{fi.timestamp:.3f}", fi.type, json.dumps(fi.evidence)])
+
 ###############################################################################
 # Alur Kerja DFRWS Utama
 ###############################################################################
@@ -390,10 +496,14 @@ def main():
             ts = idx / args.fps; h = compute_hash(fpath); frames.append(FrameInfo(index=idx, timestamp=ts, img_path=str(fpath), hash=h))
         
         # Menjalankan modul analisis lanjutan
+        audio_wav = out_dir / f"audio_{vid_path.stem}.wav"
+        extract_audio_wav(vid_path, audio_wav)
+        frame_dirs_to_cleanup.append(audio_wav)
         advanced_analysis = {
             "encoder_metadata": analyze_encoder_metadata(metadata),
             "prnu_analysis": analyze_prnu_placeholder(frames),
             "gan_deepfake_detection": analyze_gan_deepfake_placeholder(frames),
+            "audio_discontinuity": analyze_audio_discontinuity(audio_wav),
         }
         print(f"  {Icons.SUCCESS} Pemeriksaan {len(frames)} bingkai & analisis lanjutan selesai.")
         
@@ -442,13 +552,25 @@ def main():
                 pdf_name = f"laporan_tunggal_{Path(report_data.video).stem}.pdf"
             pdf_path = out_dir / pdf_name
             write_unified_report(report_data, pdf_path)
+            # Ekspor detail anomali ke CSV
+            if isinstance(report_data, ComparisonResult):
+                csv_path = out_dir / pdf_name.replace('.pdf', '.csv')
+                export_anomaly_csv(report_data.suspect_result, csv_path)
+            else:
+                csv_path = out_dir / pdf_name.replace('.pdf', '.csv')
+                export_anomaly_csv(report_data, csv_path)
             print(f"  -> {Icons.SUCCESS} Laporan PDF '{pdf_path.name}' berhasil dibuat.")
     else: print(f"  {Icons.ERROR} Tidak ada hasil untuk dilaporkan.")
 
     if not args.no_cleanup:
         print("\n" + "-"*35 + " PEMBERSIHAN " + "-"*35)
-        for frame_dir in frame_dirs_to_cleanup:
-            if frame_dir.exists(): shutil.rmtree(frame_dir); print(f"  {Icons.SUCCESS} Direktori sementara '{frame_dir.resolve()}' dihapus.")
+        for path in frame_dirs_to_cleanup:
+            if path.is_dir():
+                shutil.rmtree(path)
+                print(f"  {Icons.SUCCESS} Direktori sementara '{path.resolve()}' dihapus.")
+            elif path.is_file():
+                path.unlink()
+                print(f"  {Icons.SUCCESS} File sementara '{path.resolve()}' dihapus.")
     
     print(f"\n{Icons.SUCCESS} PROSES FORENSIK LANJUTAN SELESAI.\n")
 
